@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - 'features/develop*'
+      - main
       - DevOps-ResiliantPipeline
   pull_request:
     types: [opened, synchronize, reopened]
