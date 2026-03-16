@@ -1,11 +1,14 @@
 name: Prod-EMU
-
 on:
   push:
-    branches:
-      - 'main'
-      - DevOps-ResiliantPipeline
-      - 'features/develop*'    
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+    #branches:
+     # - 'main'
+     # - DevOps-ResiliantPipeline
+     # - 'features/develop*'    
   pull_request:
     types: [opened, synchronize, reopened]
     branches:
