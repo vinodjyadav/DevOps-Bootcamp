@@ -1,0 +1,434 @@
+name: GIT_IT_GATED_RESILIENT-GITHUB_Prod-EMU
+
+on:
+  push:
+    branches:
+      - 'features/develop*'
+      - DevOps-ResiliantPipeline
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - 'features/develop*'
+  paths:
+    - 'Common/Installation/**'
+    - 'Source/RDS.APC/**'
+    - 'Source/Tools/UpgradeTool/**'
+  workflow_dispatch:
+
+env:
+  SOLUTION_FILE_PATH:
+  SOLUTION_FOLDER: ${{ vars.SOLUTIONFOLDER }}
+  SOLUTION_NAME: ${{ vars.SOLUTIONNAME }}
+  UPGRADE_TOOL_FOLDER: Source/Tools/UpgradeTool
+  UPGRADE_TOOL_SOLUTION: RDS.APC.Design.UpgradeTool.sln
+  BUILD_CONFIGURATION: ${{ vars.BUILDCONFIGURATION }}
+  TARGET_FRAMEWORK: ${{ vars.FRAMEWORK }}
+  GITHUB_ACTIONS: true
+  IsProd: true
+  DESIGN_PATCH: Patch_${{ github.run_number }}
+  BUILD_SOURCEBRANCH: ${{ github.event_name == 'pull_request' && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.ref }}
+  BUILD_REASON: ${{ github.event_name == 'pull_request' && 'PullRequest' || github.event_name }}
+
+  SYSTEM_PULLREQUEST_SOURCEBRANCH: ${{ github.head_ref }}
+  SYSTEM_PULLREQUEST_TARGETBRANCH: ${{ github.base_ref }}
+  BUILD_SOURCESDIRECTORY: ${{ github.workspace }}
+  BUILD_BUILDNUMBER: ${{ github.run_number }}
+  BUILD_DEFINITIONNAME: ${{ github.workflow }}
+  BUILD_SOURCEVERSION: ${{ github.sha }}
+  BUILD_SOURCEBRANCHNAME: ${{ github.head_ref || github.ref_name }}
+  BUILD_NUMBER: ${{ github.run_number }}
+  PROGRAMFILES_NUGET: C:\Apps\NuGet\nuget.exe
+  SYSTEM_ACCESSTOKEN: ${{ secrets.ADO_PAT_NUGET }}
+  BranchName: ${{ github.ref }}
+  MASTER_BRANCHES: ${{ vars.MASTER_BRANCHES }}
+  SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+  NUGET_URL: ${{ vars.NUGETURL }}
+  ORGANIZATIONNAME: ${{ vars.ORGANIZATIONNAME }}
+  BUILD_REPOSITORY_NAME: 'PACE-IT'
+  NUGET_CREDENTIALPROVIDERS_DISABLED: true
+  VSTEST_PATH: ${{ vars.VSTEST_PATH }}
+  TIMESTAMP_SERVER: ${{ vars.TIMESTAMP_SERVER }}
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  build:
+    name: Build and Analyze
+    runs-on: windows-latest
+    concurrency:
+      group: ci-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4.1.0
+        with:
+          lfs: true
+          fetch-depth: 0
+
+      - name: Set major/minor version and date segment
+        shell: powershell
+        run: |
+          Write-Output "Build Number: $env:BUILD_BUILDNUMBER"
+          Write-Output "Build Definition Name: $env:BUILD_DEFINITIONNAME"
+          $versionFile = Get-ChildItem "${{ github.workspace }}/VersionInfo.txt" -ErrorAction SilentlyContinue
+          $majorVersion = "0"
+          $minorVersion = "0"
+          if ($versionFile) {
+            $versionContent = Get-Content $versionFile
+            $majorVersion = $versionContent[0].Replace("MajorVersion: ", "")
+            $minorVersion = $versionContent[1].Replace("MinorVersion: ", "")
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "PaceMajorVersion=$majorVersion"
+          Add-Content -Path $env:GITHUB_ENV -Value "PaceMinorVersion=$minorVersion"
+
+          $now = Get-Date
+          $year = $now.Year % 100
+          $dayOfYear = $now.DayOfYear
+          $dateSegment = "{0}{1:D3}" -f $year, $dayOfYear
+          Add-Content -Path $env:GITHUB_ENV -Value "DateSegment=$dateSegment"
+          Add-Content -Path $env:GITHUB_ENV -Value "RunNumber=$env:BUILD_BUILDNUMBER"
+
+      - name: Generate custom build number and detect framework
+        shell: powershell
+        run: |
+          $eventType = "${{ github.event_name }}"
+          if ($eventType -eq "push") {
+            $branchName = "${{ github.ref_name }}"
+          } elseif ($eventType -eq "pull_request") {
+            $branchName = "${{ github.head_ref }}"
+          } else {
+            $branchName = "unknown"
+          }
+
+          $customBuildNumber = "${env:BUILD_DEFINITIONNAME}_${env:PaceMajorVersion}.${env:PaceMinorVersion}.${env:DateSegment}.${env:RunNumber}_$branchName"
+          Write-Output "Custom Build Number: $customBuildNumber"
+          Add-Content -Path $env:GITHUB_ENV -Value "CustomBuildNumber=$customBuildNumber"
+          Write-Output "Build Reason: $eventType"
+
+          $csProjFile = Get-ChildItem "${{ github.workspace }}/Source/RDS.APC/RDS.APC/RDS.APC.csproj" -ErrorAction SilentlyContinue
+          if ($csProjFile) {
+            $xml = [xml](Get-Content $csProjFile)
+            $frameworks = $xml.Project.PropertyGroup.TargetFrameworks
+            if (-not $frameworks) { $frameworks = $xml.Project.PropertyGroup.TargetFrameworkVersion }
+            $version = "v4.8"
+            if ($frameworks -and ($frameworks -notmatch 'net48')) { $version = "v4.5" }
+            Write-Output "DotNet Framework Version: $version"
+            Add-Content -Path $env:GITHUB_ENV -Value "framework=$version"
+          }
+
+      - name: Stop service and purge old files
+        shell: powershell
+        run: |
+          Get-Service RDSAPCMessaging | Stop-Service -Force
+          Write-Host 'Stopped RDSAPCMessaging Service' -ForegroundColor Green
+          Start-Sleep -s 15
+          Get-ChildItem -Path 'C:\ProgramData\ShellGlobalSolutions' -Include * -File -Recurse | foreach { $_.Delete() }
+          Write-Host 'Deleted old files C:\ProgramData\ShellGlobalSolutions'
+          Get-Service RDSAPCMessaging | Start-Service
+          Write-Host 'Started RDSAPCMessaging Service' -ForegroundColor Green
+          Start-Sleep -s 15
+
+      - name: Clean .net obj and bin folders
+        shell: powershell
+        run: |
+          write-host "Deleting ShellGlobalSolutions Folder"
+          Remove-Item -Recurse -Force ${{ env.SolutionFolder }}/RDS.APC/obj/ -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force ${{ env.SolutionFolder }}/RDS.APC.ApplicationLog/obj/ -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force ${{ env.SolutionFolder }}/RDS.APC/bin/ -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force ${{ env.SolutionFolder }}/RDS.APC.ApplicationLog/bin/ -ErrorAction SilentlyContinue
+
+      - name: Apply version
+        shell: powershell
+        run: "${{ github.workspace }}/Common/Installation/Scripts/CommonApplyVersionToAssemblies.ps1 -SourceDirectory \"${{ github.workspace }}/${{ env.SolutionFolder }}\" -BuildNumber \"${{ github.run_number }}\" -ContentType \"DotNet\" -RepositoryName \"PACE-IT\" -OrganizationName \"${{ env.OrganizationName }}\" -SecurityToken \"${{ secrets.GIT_HUB_PAT }}\""
+
+      - name: Apply version Tools/UpgradeTool
+        shell: powershell
+        run: "${{ github.workspace }}/Common/Installation/Scripts/CommonApplyVersionToAssemblies.ps1 -SourceDirectory \"${{ github.workspace }}/Source/Tools/UpgradeTool\" -BuildNumber \"${{ github.run_number }}\" -ContentType \"DotNet\" -RepositoryName \"PACE-IT\" -OrganizationName \"${{ env.OrganizationName }}\" -SecurityToken \"${{ secrets.GIT_HUB_PAT }}\""
+
+      - name: Update Kernel Package Versions - Libraries
+        shell: powershell
+        timeout-minutes: 5
+        run: |
+          Add-Type -AssemblyName "System.Web.Extensions"
+          Add-Type -AssemblyName "System.Web"
+          Add-Type -AssemblyName "System.Xml"
+          ${{ github.workspace }}\Common\Installation\Scripts\update-package-versions.ps1 -RootDirectory "${{ github.workspace }}\Source\Libraries"
+
+      - name: NuGet Restore Kernel Packages - Libraries
+        shell: powershell
+        run: |
+          $nuget = 'C:\Apps\NuGet\nuget.exe'
+          & $nuget restore ${{ github.workspace }}\Source\Libraries\packages.config -PackagesDirectory ${{ github.workspace }}\Source\Libraries\packages -NoCache -Verbosity "Detailed" -NonInteractive
+
+      - name: Extract Kernel Package Contents - Libraries
+        shell: powershell
+        run: ${{ github.workspace }}\Common\Installation\Scripts\extract-package-contents.ps1 -RootDirectory "${{ github.workspace }}\Source\Libraries"
+
+      - name: Modify .net Core for package version
+        shell: powershell
+        run: |
+          ${{ github.workspace }}\Common\Installation\Scripts\ApplyPackageVersionToCoreAssemblies.ps1 `
+          -SourceDirectory "${{ github.workspace }}/${{ env.SolutionFolder }}" `
+          -BuildNumber "${{ env.CustomBuildNumber }}" `
+          -BranchName "${{ env.BUILD_SOURCEBRANCHNAME }}"
+
+      - name: dotnet clean
+        if: success() && env.PaceMajorVersion >= 5.04
+        shell: powershell
+        run: |
+          dotnet clean ${{ github.workspace }}/Source/RDS.APC/RDS.APC.csproj --configuration Build -p:Platform="AnyCPU"
+          dotnet clean ${{ github.workspace }}/Source/RDS.APC/RDS.APC.ApplicationLog/RDS.APC.ApplicationLog.csproj --configuration Build -p:Platform="AnyCPU"
+
+      - name: dotnet restore
+        if: success() && env.PaceMajorVersion >= 5.04
+        shell: powershell
+        run: |
+          dotnet nuget add source "$NUGET_URL" --name "PACE" --username "n/a" --password "${{ secrets.ADO_PAT_NUGET }}" --store-password-in-clear-text
+          dotnet restore ${{ github.workspace }}/Source/RDS.APC/RDS.APC.csproj --verbosity "Detailed"
+          dotnet restore ${{ github.workspace }}/Source/RDS.APC/RDS.APC.ApplicationLog/RDS.APC.ApplicationLog.csproj --verbosity "Detailed"
+
+      - name: dotnet build
+        if: success() && env.PaceMajorVersion >= 5.04
+        shell: powershell
+        run: |
+          dotnet build ${{ github.workspace }}/Source/RDS.APC/RDS.APC.csproj --configuration Build --no-restore -p:Platform="AnyCPU"
+          dotnet build ${{ github.workspace }}/Source/RDS.APC/RDS.APC.ApplicationLog/RDS.APC.ApplicationLog.csproj --configuration Build --no-restore -p:Platform="AnyCPU"
+
+      - name: Update RDS.APC.csproj and ApplicationLog targetframework
+        if: success() && env.PaceMajorVersion >= 5.04
+        shell: powershell
+        run: |
+          Write-Host "Changing target of RDS.APC.csproj and RDS.APC.ApplicationLog.csproj to .net48"
+          $csProjFile = "$env:BUILD_SOURCESDIRECTORY/Source/RDS.APC/RDS.APC.ApplicationLog/RDS.APC.ApplicationLog.csproj"
+          $xml = [Xml] (Get-Content $csProjFile)
+          $xml.SelectSingleNode("//PropertyGroup/TargetFrameworks").InnerText = "net48"
+          $xml.Save($csProjFile)
+          $csProjFile = "$env:BUILD_SOURCESDIRECTORY/Source/RDS.APC/RDS.APC.csproj"
+          $xml = [Xml] (Get-Content $csProjFile)
+          $xml.SelectSingleNode("//PropertyGroup/TargetFrameworks").InnerText = "net48"
+          $xml.Save($csProjFile)
+
+      - name: NuGet restore solution
+        env:
+          NUGET_CREDENTIALPROVIDERS_DISABLED: true
+        shell: powershell
+        timeout-minutes: 5
+        run: |
+          $nuget = 'C:\Apps\NuGet\nuget.exe'
+          & $nuget restore ${{ github.workspace }}/Source/RDS.APC/RDS.APC.sln -PackagesDirectory ${{ github.workspace }}/Source/RDS.APC -NoCache -Verbosity "Detailed" -NonInteractive
+
+      - name: NuGet UpgradeTool Restore
+        if: success() && env.PaceMajorVersion >= 5.04
+        shell: powershell
+        run: |
+          $nuget = 'C:\Apps\NuGet\nuget.exe'
+          & $nuget restore ${{ github.workspace }}/Source/Tools/UpgradeTool/RDS.APC.Design.UpgradeTool.sln -NoCache -Verbosity "Detailed" -NonInteractive
+
+      - name: Build Solution
+        shell: powershell
+        run: |
+          msbuild "${{ env.SOLUTION_FOLDER }}\${{ env.SOLUTION_NAME }}" `
+          /p:OutDir="${{ github.workspace }}\Binaries" `
+          /p:SkipInvalidConfigurations=true /maxcpucount `
+          /p:Configuration="Release" /p:Platform="Any CPU" `
+          /p:RunCodeAnalysis="False" /p:nodeReuse="False" `
+          /p:TargetFrameworkVersion="${{ env.TARGET_FRAMEWORK }}" `
+          /p:RestorePackages=false `
+          /p:TelerikLicenseKey="${{ secrets.TELERIKLICENSEKEY }}"
+
+      - name: Build RDS.APC.Design.UpgradeTool Solution
+        shell: powershell
+        run: |
+          msbuild ${{ github.workspace }}/Source/Tools/UpgradeTool/RDS.APC.Design.UpgradeTool.sln /p:SkipInvalidConfigurations=true /maxcpucount:1 /p:Configuration="Release" /p:Platform="Any CPU" /p:RunCodeAnalysis="False" /p:nodeReuse="False" /p:TargetFrameworkVersion="${{ env.TARGET_FRAMEWORK }}" /v:normal
+
+      - name: Copy RDS.APC.Design.UpgradeTool files (legacy)
+        if: success() && env.PaceMajorVersion <= 5.05
+        shell: powershell
+        run: |
+          $source = "Source/Tools/UpgradeTool/RDS.APC.Design.UpgradeTool/bin/Release"
+          $target = "${{ github.workspace }}/Binaries"
+          New-Item -ItemType Directory -Force -Path $target
+          Copy-Item -Path "$source/**/RDS.APC.Design.UpgradeTool*" -Destination $target -Recurse
+
+      - name: Copy RDS.APC.Design.UpgradeTool files (net48)
+        if: success() && env.PaceMajorVersion >= 5.06
+        uses: actions/github-script@v7.0.0
+        env:
+          TARGET_FOLDER: "${{ github.workspace }}/Binaries"
+          SOURCE_FOLDER: Source/Tools/UpgradeTool/RDS.APC.Design.UpgradeTool/bin/Release/net48
+          CLEAN_TARGET_FOLDER: false
+          FLATTEN_FOLDERS: false
+          OVERWRITE: false
+          CONTENTS: "**\\RDS.APC.Design.UpgradeTool**"
+        with:
+          github-token: "${{ secrets.GITHUB_TOKEN }}"
+          script: |
+            const fs = require('fs').promises
+            const path = require('path')
+            const target = path.resolve(process.env.TARGET_FOLDER)
+            const io = require('@actions/io')
+            const glob = require('@actions/glob')
+            process.chdir(process.env.SOURCE_FOLDER || '.')
+            if (process.env.CLEAN_TARGET_FOLDER === 'true') await io.rmRF(target)
+            const flattenFolders = process.env.FLATTEN_FOLDERS === 'true'
+            const options = {force: process.env.OVERWRITE === 'true'}
+            const globber = await glob.create(process.env.CONTENTS || '**')
+            for await (const file of globber.globGenerator()) {
+              const stat = await fs.stat(file)
+              if (stat.isDirectory()) continue
+              const dest = path.join(target, flattenFolders ? path.basename(file) : file.substring(process.cwd().length))
+              await fs.mkdir(path.dirname(dest), {recursive: true})
+              await fs.copyFile(file, dest)
+            }
+
+      - name: Update Kernel Package Versions - Binaries
+        shell: powershell
+        run: Common/Installation/Scripts/update-package-versions.ps1 -RootDirectory "${{ github.workspace }}/Binaries"
+
+      - name: NuGet Restore Kernel Packages - Binaries
+        shell: powershell
+        run: |
+          nuget sources add -Source "https://pkgs.dev.azure.com/sede-pt-esdv/_packaging/5c91d206-b3b3-41e7-a292-172ea6bc2151/nuget/v3/index.json" -Name "5c91d206-b3b3-41e7-a292-172ea6bc2151" -Username "n/a" -Password "${{ secrets.AZURE_DEVOPS_TOKEN }}"
+          nuget restore ${{ github.workspace }}/Binaries/packages.config -NoCache -PackagesDirectory "${{ github.workspace }}/Binaries/packages" -Verbosity "Detailed"
+
+      - name: Extract Kernel Package Contents - Binaries
+        shell: powershell
+        run: Common/Installation/Scripts/extract-package-contents.ps1 -RootDirectory '${{ github.workspace }}/Binaries'
+
+      - name: Import Certificate
+        if: success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch') && env.PaceMajorVersion >= 5.04 && env.IsProd == 'true'
+        shell: powershell
+        run: |
+          $folderPath = "${{ github.workspace }}/Binaries/Certificates"
+          if (!(Test-Path $folderPath -PathType Container)) {
+            New-Item -ItemType Directory -Force -Path $folderPath
+          }
+          $blobUri = "${{ secrets.EKMS_BLOB_URI }}"
+          $sas = "${{ secrets.EKMS_CERT_SAS_TOKEN }}"
+          $outputPath = "${{ github.workspace }}/Binaries/Certificates/" + "${{ secrets.EKMS_CERT_NAME }}"
+          $fullUri = "$blobUri$sas"
+          (New-Object System.Net.WebClient).DownloadFile($fullUri, $outputPath)
+
+      - name: Certify Binaries Using EKMS
+        if: success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch') && env.PaceMajorVersion >= 5.04 && env.IsProd == 'true'
+        shell: powershell
+        run: |
+          & "${{ github.workspace }}\Common\Installation\Scripts\apply-certificate-to-binaries.ps1" `
+          -SourceDirectory "${{ github.workspace }}" `
+          -PRIVATE_KEY "${{ secrets.EKMS_PRIVATE_KEY }}" `
+          -CERT_LOCATION "${{ github.workspace }}\Binaries\Certificates\EntrustCertificate.crt" `
+          -TIME_STAMP_URL "${{ env.TIMESTAMP_SERVER }}" `
+          -MAJOR_VERSION "${{ env.PaceMajorVersion }}" `
+          -REPOSITORY "PACE-IT"
+
+      - name: Copy RDS.APC.ApplicationLog and RDS.APC nupkg
+        if: success() && env.PaceMajorVersion >= 5.04
+        shell: powershell
+        run: |
+          $source = "${{ env.SolutionFolder }}"
+          $target = "${{ runner.temp }}"
+          $patterns = @("**RDS.APC.ApplicationLog.*.nupkg", "**RDS.APC.*.nupkg")
+          foreach ($pattern in $patterns) {
+            $files = Get-ChildItem -Path $source -Filter $pattern -Recurse -File
+            foreach ($file in $files) {
+              $dest = Join-Path $target $file.Name
+              Copy-Item -Path $file.FullName -Destination $dest -Force
+            }
+          }
+
+      - name: Test RDS.APC.Tests.Kernel.dll
+        shell: powershell
+        run: |
+          $dllPath = Join-Path $env:GITHUB_WORKSPACE "Binaries\RDS.APC.Tests.Kernel.dll"
+          $vstestPath = "${{ vars.VSTEST_PATH }}"
+          $resultsDir = Join-Path $env:GITHUB_WORKSPACE "TestResults"
+          $filter = 'TestCategory!=Outcome-Failed&Name!=AIDAKernelTest_F2P&Name!=AIDAKernelTest_FitPAR&Name!=AIDAKernelTest_PARVAL&Name!=AIDAKernelTest_PARPrediction&Name!=AIDAKernelTest_FitPARWithException&Name!=AIDAKernelTest_FitPARWithErrdir&Name!=AIDAKernelTest_FitPARwithErr&Name!=AIDAKernelTest_FIRPrediction&Name!=PerformFit_Executes_FIR_FIT_With_Returns_Results&Name!=ModelEditor_first_order_system_non_convoluted_smaller_plot_horizon_than_default_generates_plot_data_with_correct_horizon'
+          if (-not (Test-Path $resultsDir)) { New-Item -ItemType Directory -Path $resultsDir }
+          Write-Host "Running tests..."
+          & "$vstestPath" "$dllPath" "/Logger:trx" "/TestCaseFilter:$filter" "/ResultsDirectory:$resultsDir" "/platform:x64"
+
+      - name: Test RDS.APC.Runtime.Tests.Integration.dll
+        shell: powershell
+        run: |
+          $dllPath = Join-Path $env:GITHUB_WORKSPACE "Binaries/RDS.APC.Runtime.Tests.Integration.dll"
+          $vstestPath = "${{ vars.VSTEST_PATH }}"
+          $resultsDir = Join-Path $env:GITHUB_WORKSPACE "TestResults"
+          $filter = 'TestCategory!=Outcome-Failed&Name!=Application_Audit_Statistics_Test&Name!=Application_Manage_Audit_Statistics_Test'
+          if (-not (Test-Path $resultsDir)) { New-Item -ItemType Directory -Path $resultsDir }
+          Write-Host "Running tests..."
+          & "$vstestPath" "$dllPath" "/Logger:trx" "/TestCaseFilter:$filter" "/ResultsDirectory:$resultsDir" "/platform:x64"
+
+      - name: Test RDS.APC.Runtime.Tests.dll
+        shell: powershell
+        run: |
+          $dllPath = Join-Path $env:GITHUB_WORKSPACE "Binaries/RDS.APC.Runtime.Tests.dll"
+          $vstestPath = "${{ vars.VSTEST_PATH }}"
+          $resultsDir = Join-Path $env:GITHUB_WORKSPACE "TestResults"
+          $filter = 'TestCategory!=Outcome-Failed'
+          if (-not (Test-Path $resultsDir)) { New-Item -ItemType Directory -Path $resultsDir }
+          Write-Host "Running tests..."
+          & "$vstestPath" "$dllPath" "/Logger:trx" "/TestCaseFilter:$filter" "/ResultsDirectory:$resultsDir" "/platform:x64"
+
+      - name: Test RDS.APC.Tests.Integration.dll
+        shell: powershell
+        run: |
+          $dllPath = Join-Path $env:GITHUB_WORKSPACE "Binaries\RDS.APC.Tests.Integration.dll"
+          $vstestPath = "${{ vars.VSTEST_PATH }}"
+          $resultsDir = Join-Path $env:GITHUB_WORKSPACE "TestResults"
+          $filter = 'TestCategory!=Outcome=Failed'
+          if (-not (Test-Path $resultsDir)) { New-Item -ItemType Directory -Path $resultsDir }
+          Write-Host "Running tests..."
+          & "$vstestPath" "$dllPath" "/Logger:trx" "/TestCaseFilter:$filter" "/ResultsDirectory:$resultsDir" "/platform:x64"
+
+      - name: Test RDS.APC.Tests.dll
+        shell: powershell
+        run: |
+          $dllPath = Join-Path $env:GITHUB_WORKSPACE "Binaries\RDS.APC.Tests.dll"
+          $vstestPath = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\IDE\Extensions\TestPlatform\vstest.console.exe"
+          $resultsDir = Join-Path $env:GITHUB_WORKSPACE "TestResults"
+          $filter = 'TestCategory!=Outcome=Failed&Name!=Disable_Generate_Subsystem_When_Model_InValid&Name!=UpdateWorkspaceXML_Updates_Runtime_Validity_Of_Versions&Name!=WorkspaceDatabase_Schema_Comparision_UpgradeTool'
+          if (-not (Test-Path $resultsDir)) { New-Item -ItemType Directory -Path $resultsDir }
+          Write-Host "Running tests..."
+          & "$vstestPath" "$dllPath" "/Logger:trx" "/TestCaseFilter:$filter" "/ResultsDirectory:$resultsDir" "/platform:x64"
+
+      - name: NuGet Spec
+        if: success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch') && env.PaceMajorVersion >= 5.04 && env.IsProd == 'true'
+        shell: powershell
+        run: "& '${{ github.workspace }}/CommonInstallation/Scripts/nuget-spec-solution.ps1' -Path '${{ github.workspace }}\\${{ env.SOLUTION_FOLDER }}\\${{ env.SOLUTION_NAME }}' -OutputDirectory '${{ runner.temp }}' -Version '${{ github.run_number }}' -BinaryPath '${{ github.workspace }}\\Binaries'"
+
+      - name: NuGet Pack
+        if: success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch') && env.PaceMajorVersion >= 5.04 && env.IsProd == 'true'
+        shell: powershell
+        run: |
+          $nuspecFiles = Get-ChildItem "${{ runner.temp }}" -Filter *.nuspec
+          foreach ($file in $nuspecFiles) {
+            nuget pack "${file.FullName}" -OutputDirectory "${{ runner.temp }}" -Verbosity Detailed -Properties Configuration=${{ env.BUILD_CONFIGURATION }}
+          }
+
+      - name: NuGet push
+        if: success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch')
+        continue-on-error: true
+        shell: powershell
+        run: |
+          nuget sources add -Source "${{ env.NUGET_URL }}" -Name "PACE" -Username "n/a" -Password "${{ secrets.AZURE_DEVOPS_PAT }}"
+          $pkgs = Get-ChildItem "${{ runner.temp }}" -Filter *.nupkg -Recurse
+          foreach ($pkg in $pkgs) {
+            $success = $false
+            $attempt = 0
+            while (-not $success -and $attempt -lt 2) {
+              try {
+                nuget push $pkg.FullName -Source "PACE" -ApiKey "${{ secrets.AZURE_DEVOPS_PAT }}" -SkipDuplicate -Verbosity Detailed
+                $success = $true
+              } catch {
+                Write-Host "NuGet push failed for $($pkg.FullName). Attempt $($attempt + 1). Retrying..."
+                Start-Sleep -Seconds 5
+              }
+              $attempt++
+            }
+            if (-not $success) {
+              Write-Host "NuGet push failed for $($pkg.FullName) after 2 attempts."
+            }
+          }
