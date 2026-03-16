@@ -1,4 +1,4 @@
-name: GIT_IT_GATED_RESILIENT-GITHUB_Prod-EMU
+name: Prod-EMU
 
 on:
   push:
@@ -29,7 +29,6 @@ env:
   DESIGN_PATCH: Patch_${{ github.run_number }}
   BUILD_SOURCEBRANCH: ${{ github.event_name == 'pull_request' && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.ref }}
   BUILD_REASON: ${{ github.event_name == 'pull_request' && 'PullRequest' || github.event_name }}
-
   SYSTEM_PULLREQUEST_SOURCEBRANCH: ${{ github.head_ref }}
   SYSTEM_PULLREQUEST_TARGETBRANCH: ${{ github.base_ref }}
   BUILD_SOURCESDIRECTORY: ${{ github.workspace }}
