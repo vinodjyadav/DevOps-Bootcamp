@@ -3,9 +3,9 @@ name: GIT_IT_GATED_RESILIENT-GITHUB_Prod-EMU
 on:
   push:
     branches:
-      - 'features/develop*'
-      - main
+      - 'main'
       - DevOps-ResiliantPipeline
+      - 'features/develop*'    
   pull_request:
     types: [opened, synchronize, reopened]
     branches:
